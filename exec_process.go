@@ -36,6 +36,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/containerd/console"
 	"github.com/containerd/containerd/errdefs"
+	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/pkg/stdio"
 	"github.com/containerd/containerd/runtime"
 	"github.com/containerd/fifo"
@@ -163,6 +164,12 @@ func (e *execProcess) Delete(ctx context.Context) (*runtime.Exit, error) {
 
 	if err := e.execState.Delete(ctx); err != nil {
 		return nil, err
+	}
+
+	if m := e.shim().manager; m != nil && m.store != nil {
+		if err := m.store.DeleteExec(e.parent.bundle.Namespace, e.parent.ID(), e.id); err != nil {
+			log.G(ctx).WithError(err).Warnf("failed to remove exec %s record", e.id)
+		}
 	}
 
 	e.shim().deleteExecProcess(e.id)
@@ -395,26 +402,40 @@ func (e *execProcess) start(ctx context.Context) (retErr error) {
 
 		e.pid.pid = int(execPid)
 		e.pidFD = pidFD
-		return pidMonitor.pidPoller.Add(pidFD, func() error {
-			execPid := e.Pid()
-
-			status := 255
-
-			event, err := execExitStore.GetExitedEvent(e.traceEventID)
-			if err == nil && event.Pid == uint32(execPid) {
-				status = int(event.ExitCode)
-			}
-			execExitStore.DeleteExitedEvent(e.traceEventID)
-
-			e.SetExited(status)
-			return nil
-		})
+		return e.traceExit(pidMonitor, pidFD)
 	})
 	if invokeErr != nil {
 		close(e.waitBlock)
 		return e.parent.runtimeError(invokeErr, "OCI runtime exec failed")
 	}
+
+	if m := e.shim().manager; m != nil {
+		if err := m.saveExecRecord(e, execPhaseRunning); err != nil {
+			log.G(ctx).WithError(err).Warnf("failed to persist exec %s record", e.id)
+		}
+	}
 	return nil
+}
+
+// traceExit registers the pidfd-based exit watch for the exec process.
+// The exit status itself is read from the exitsnoop store — the same
+// reconciliation source used to replay exits after a restart.
+func (e *execProcess) traceExit(pidMonitor *monitor, pidFD pidfd.FD) error {
+	execExitStore := pidMonitor.execStore
+	return pidMonitor.pidPoller.Add(pidFD, func() error {
+		execPid := e.Pid()
+
+		status := 255
+
+		event, err := execExitStore.GetExitedEvent(e.traceEventID)
+		if err == nil && event.Pid == uint32(execPid) {
+			status = int(event.ExitCode)
+		}
+		execExitStore.DeleteExitedEvent(e.traceEventID)
+
+		e.SetExited(status)
+		return nil
+	})
 }
 
 func (e *execProcess) handleIOAfterExec(ctx context.Context, pio *processIO, socket *runc.Socket) error {

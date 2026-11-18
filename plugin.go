@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	pkgbundle "github.com/fuweid/embedshim/pkg/bundle"
 	"github.com/fuweid/embedshim/pkg/exitsnoop"
 
 	"github.com/containerd/containerd/containers"
+	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/events/exchange"
 	"github.com/containerd/containerd/identifiers"
 	"github.com/containerd/containerd/log"
@@ -68,6 +70,10 @@ func New(ic *plugin.InitContext) (interface{}, error) {
 		containers: metadata.NewContainerStore(m.(*metadata.DB)),
 		events:     ic.Events,
 		config:     cfg,
+
+		store:    newFileStateStore(ic.State, nil),
+		procs:    procInspector{},
+		recovery: newRecoveryRegistry(),
 	}
 
 	if err := tm.init(); err != nil {
@@ -90,6 +96,14 @@ type TaskManager struct {
 
 	idAlloc *idAllocator
 	monitor *monitor
+
+	// store persists task/exec records so the task table can be rebuilt
+	// after a restart; procs resolves process identity (pid reuse
+	// protection); recovery tracks which tasks are still being recovered
+	// so queries can tell "recovering" apart from "not found".
+	store    taskStateStore
+	procs    processInspector
+	recovery *recoveryRegistry
 }
 
 func (*TaskManager) ID() string {
@@ -132,6 +146,27 @@ func (manager *TaskManager) Create(ctx context.Context, id string, opts runtime.
 		}
 	}()
 
+	// Persist the intent to create before touching the OCI runtime. If
+	// the host crashes from here on, recovery finds a creating-phase
+	// record and cleans the leftovers instead of resurrecting a
+	// half-built task.
+	if err := manager.store.SaveTask(&TaskRecord{
+		ID:           id,
+		Namespace:    ns,
+		BundlePath:   bundle.Path,
+		TraceEventID: traceEventID,
+		Phase:        taskPhaseCreating,
+		CreatedAt:    time.Now(),
+		Stdio: stdioRecord{
+			Stdin:    opts.IO.Stdin,
+			Stdout:   opts.IO.Stdout,
+			Stderr:   opts.IO.Stderr,
+			Terminal: opts.IO.Terminal,
+		},
+	}); err != nil {
+		return nil, fmt.Errorf("failed to persist task record: %w", err)
+	}
+
 	s, err := newShim(manager, bundle)
 	if err != nil {
 		return nil, err
@@ -142,12 +177,37 @@ func (manager *TaskManager) Create(ctx context.Context, id string, opts runtime.
 		return nil, fmt.Errorf("failed to create init process: %w", err)
 	}
 
+	if err := manager.saveTaskRecord(s.init, taskPhaseCreated); err != nil {
+		log.G(ctx).WithError(err).Warnf("failed to persist task %s record", id)
+	}
+
 	manager.tasks.Add(ctx, task)
 	return task, nil
 }
 
 func (manager *TaskManager) Get(ctx context.Context, id string) (runtime.Task, error) {
-	return manager.tasks.Get(ctx, id)
+	task, err := manager.tasks.Get(ctx, id)
+	if err == nil {
+		return task, nil
+	}
+	if !errors.Is(err, runtime.ErrTaskNotExists) && !errors.Is(err, errdefs.ErrNotFound) {
+		return nil, err
+	}
+
+	// The task is not in the in-memory table. If recovery is still in
+	// flight (or the task proved unrecoverable), say so instead of
+	// reporting a misleading "not found" — a client acting on "not
+	// found" might recreate a task that is in fact alive.
+	if ns, ok := namespaces.Namespace(ctx); ok {
+		key := taskKey(ns, id)
+		if manager.recovery.isPending(key) {
+			return nil, fmt.Errorf("task %s is still being recovered: %w", id, errdefs.ErrUnavailable)
+		}
+		if uerr := manager.recovery.unrecoverableErr(key); uerr != nil {
+			return nil, fmt.Errorf("task %s cannot be recovered: %v", id, uerr)
+		}
+	}
+	return nil, fmt.Errorf("task %s: %w", id, errdefs.ErrNotFound)
 }
 
 func (manager *TaskManager) Add(ctx context.Context, task runtime.Task) error {

@@ -136,15 +136,36 @@ func (s *shim) Namespace() string {
 }
 
 func (s *shim) Pause(ctx context.Context) error {
-	return s.init.Pause(ctx)
+	if err := s.init.Pause(ctx); err != nil {
+		return err
+	}
+	s.persistPhase(ctx, taskPhasePaused)
+	return nil
 }
 
 func (s *shim) Resume(ctx context.Context) error {
-	return s.init.Resume(ctx)
+	if err := s.init.Resume(ctx); err != nil {
+		return err
+	}
+	s.persistPhase(ctx, taskPhaseRunning)
+	return nil
 }
 
 func (s *shim) Start(ctx context.Context) error {
-	return s.init.Start(ctx)
+	if err := s.init.Start(ctx); err != nil {
+		return err
+	}
+	s.persistPhase(ctx, taskPhaseRunning)
+	return nil
+}
+
+// persistPhase records the task phase so recovery after a restart rebuilds
+// the state the user last observed. Persistence is best-effort here: the
+// operation itself already succeeded.
+func (s *shim) persistPhase(ctx context.Context, phase string) {
+	if err := s.manager.saveTaskRecord(s.init, phase); err != nil {
+		log.G(ctx).WithError(err).Warnf("failed to persist task %s phase %s", s.ID(), phase)
+	}
 }
 
 func (s *shim) Kill(ctx context.Context, signal uint32, all bool) error {
@@ -170,6 +191,12 @@ func (s *shim) Exec(ctx context.Context, execID string, opts runtime.ExecOpts) (
 		return nil, err
 	}
 	s.addExecProcess(process)
+
+	if ep, ok := process.(*execProcess); ok {
+		if err := s.manager.saveExecRecord(ep, execPhaseCreated); err != nil {
+			log.G(ctx).WithError(err).Warnf("failed to persist exec %s record", execID)
+		}
+	}
 	return process, nil
 }
 
@@ -297,6 +324,15 @@ func (s *shim) Delete(ctx context.Context) (*runtime.Exit, error) {
 	err := s.init.Delete(ctx)
 	if err != nil && !errors.Is(err, errdefs.ErrNotFound) {
 		return nil, err
+	}
+
+	// Drop the persisted record before the bundle: a crash after this
+	// point leaves a record-less bundle, which the legacy reload path
+	// reconciles, rather than a record pointing at a vanished bundle.
+	if s.manager.store != nil {
+		if derr := s.manager.store.DeleteTask(s.bundle.Namespace, s.ID()); derr != nil {
+			log.G(ctx).WithError(derr).Warnf("failed to remove task %s record", s.ID())
+		}
 	}
 
 	if err := s.bundle.Delete(); err != nil {
